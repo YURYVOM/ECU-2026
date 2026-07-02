@@ -1,0 +1,299 @@
+---
+title: "Coordinación de muestras – Esquema 2-2-2"
+author: "CEPAL"
+date: "2026-04-09"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    collapsed: true
+    smooth_scroll: true
+    theme: journal
+    highlight: kate
+    df_print: paged
+    code_folding: show
+    css: styles.css
+---
+
+```{r setup, include=FALSE}
+library(SamplingCoordination)
+library(dplyr)
+library(purrr)
+library(DT)
+library(TeachingSampling)
+
+
+
+```
+
+# Simulación de un Marco de muestreo
+
+Se genera una base ficticia de UPM con su respectivo número de viviendas.
+A partir de esta variable se define la probabilidad de inclusión, denotada por $pi_i$.
+
+```{r echo=TRUE, include=TRUE}
+n_upm <- 200
+
+base_upm <- tibble(
+  id_upm = sprintf("UPM_%03d", 1:n_upm),
+  viviendas = sample(50:500, n_upm, replace = TRUE),
+  pi_i = round(PikPPS(n = 60, x = viviendas),5)
+)
+
+datatable(base_upm)
+```
+
+## Construcción del Pareto
+
+Para la coordinación de muestras se utiliza el algoritmo de Pareto. Este algoritmo construye, para cada UPM $i$, el siguiente valor:
+
+$$\xi_i^{\text{pareto}} = \frac{\zeta_i / (1 - \zeta_i)}{\pi_i / (1 - \pi_i)}$$
+
+donde:
+
+-   $\zeta_i$ es un número aleatorio permanente uniforme en (0, 1),
+-   $\pi_i$ es la probabilidad de inclusión de la UPM $i$.
+
+Las UPM se ordenan de menor a mayor según $\xi_i^{\text{pareto}}$, y este orden se utiliza como base para la construcción de los mini-paneles.
+
+```{r include=TRUE, echo=TRUE}
+set.seed(123)
+base_upm <- base_upm %>%
+  mutate(
+    permanent = runif(n())
+  )
+
+# Score de Pareto
+base_upm <- base_upm %>%
+  transmute(
+    id_upm,
+    viviendas,
+    pareto = round((permanent / (1 - permanent)) / (pi_i / (1 - pi_i)),5)
+  )%>%
+  arrange(pareto) %>%
+  mutate(rank = row_number())
+
+datatable(base_upm)
+```
+
+# Rotación teórica de mini-paneles
+
+Se genera la rotación 2-2-2 para tres bloques mensuales: Mes 1 (A-B), Mes 2 (C-D) y Mes 3 (E-F), a lo largo de 15 trimestres.
+
+## Esquema de rotación 2-2-2
+
+- Cada mini-panel participa **2 trimestres**, descansa **2** y regresa **2**, 
+  completando un ciclo de 6 trimestres.
+- Los mini-paneles se agrupan por mes de entrevista: **Mes 1** (A-B), 
+  **Mes 2** (C-D) y **Mes 3** (E-F).
+- El ingreso escalonado entre pares garantiza **2 mini-paneles activos 
+  por mes** durante los 15 trimestres.
+
+```{r include=TRUE, echo=TRUE}
+
+# 15 trimestres
+period <- 15
+
+rotacion <- cbind(
+  Rotating_panels(A = 2, B = 2, C = 2, period = period, value_initial = "A"),
+  Rotating_panels(A = 2, B = 2, C = 2, period = period, value_initial = "C"),
+  Rotating_panels(A = 2, B = 2, C = 2, period = period, value_initial = "E")
+) %>%
+  as.data.frame()
+
+rotacion$trimestre <- paste0("Trimestre ", 1:nrow(rotacion))
+
+datatable(rotacion)
+```
+
+## Rotación en formato largo
+
+La tabla de rotación se transforma a formato largo para identificar, por trimestre, la posición del mini-panel y el mini-panel teórico asociado.
+
+```{r include=TRUE, echo=TRUE}
+
+rotacion_long <- rotacion %>%
+  pivot_longer(
+    cols = -trimestre,
+    names_to = "posicion",
+    values_to = "minipanel_teorico"
+  )
+
+datatable(rotacion_long)
+```
+
+## Identificación del mes dentro del trimestre
+
+Cada posición se clasifica en uno de los tres meses del trimestre.
+
+```{r include=TRUE, echo=TRUE}
+
+rotacion_long <- rotacion_long %>%
+  mutate(
+    mes = case_when(
+      posicion %in% c("A", "B") ~ "Mes 1",
+      posicion %in% c("C", "D") ~ "Mes 2",
+      posicion %in% c("E", "F") ~ "Mes 3"
+    )
+  )
+
+datatable(rotacion_long)
+```
+
+# Construcción de mini paneles en nuestra base 
+
+Se agrupan las UPM en bloques de 5 unidades. Cada bloque conforma un mini-panel, nombrado secuencialmente como A1, B1, ..., L1, A2, B2, etc.
+
+```{r include=TRUE, echo=TRUE}
+tam_minipanel_real <- 10
+letras_panel <- LETTERS[1:6]   # A, B, ..., L
+
+base_upm <- base_upm %>%
+  mutate(grupo = ceiling(rank / tam_minipanel_real),
+         minipanel_real = paste0(
+           letras_panel[((grupo - 1) %% 6) + 1],
+           ceiling(grupo / 6)
+         )) %>%
+  select(-grupo)
+
+datatable(base_upm)
+```
+
+## Mini-paneles disponibles en la base de UPM
+
+Se identifica la secuencia real de mini-paneles disponibles en la base, siguiendo el orden del Pareto.
+
+```{r include=TRUE, echo=TRUE}
+
+minipanel_reales_disponibles <- base_upm %>%
+  arrange(rank) %>%
+  distinct(minipanel_real) %>%
+  pull(minipanel_real) # para hacerlo un vector
+
+minipanel_reales_disponibles
+
+```
+
+# Ajuste cíclico de la rotación
+
+Cuando la rotación teórica requiere más mini-paneles de los disponibles, se reutilizan de forma secuencial siguiendo el orden del rank. Es decir, cuando se acaban, se vuelve a empezar desde el primero.
+
+```{r include=TRUE, echo=TRUE}
+
+equiv <- tibble(
+  minipanel_teorico = setdiff(unique(rotacion_long$minipanel_teorico), minipanel_reales_disponibles),
+  minipanel_real = minipanel_reales_disponibles[seq_along(setdiff(unique(rotacion_long$minipanel_teorico), minipanel_reales_disponibles))]
+)
+
+datatable(equiv)
+
+
+# pegar equivalencias
+rotacion_long <- rotacion_long %>%
+  left_join(equiv, by = "minipanel_teorico") %>%
+  mutate(
+    minipanel_real = ifelse(is.na(minipanel_real), minipanel_teorico, minipanel_real)
+  )
+
+datatable(rotacion_long)
+```
+
+# Asignación de la rotación a las UPM
+
+Se asigna a cada UPM su participación en la muestra según el mini-panel teórico al que pertenece, conservando internamente el mini-panel usado para la unión con la base de UPM.
+
+```{r, echo=TRUE, include=TRUE}
+# Tabla de asignación (rotación final)
+asignacion <- rotacion_long %>%
+  select(trimestre, mes, minipanel_teorico, minipanel_real) %>%
+  distinct()
+
+datatable(asignacion)
+```
+
+```{r, echo=TRUE, include=TRUE}
+# Unión con la base de UPM
+base_muestra <- base_upm %>%
+  left_join(asignacion, by = c("minipanel_real"),relationship = "many-to-many" ) %>%
+  mutate(valor = ifelse(is.na(trimestre), 0, 1),
+    minipanel_asignado = ifelse(is.na(minipanel_teorico), minipanel_real, minipanel_teorico)
+  )
+```
+
+# Matriz final por trimestre y mes
+
+Con base en la asignación de la rotación a las UPM, se construyen matrices en formato ancho que permiten visualizar la participación de cada unidad en los distintos periodos del esquema de rotación.
+
+En particular, cada periodo se define a nivel de trimestre y mes, generando identificadores del tipo T1_M1, T1_M2, …, T15_M3, lo que permite un seguimiento detallado de la dinámica temporal de la muestra.
+
+```{r, echo=FALSE, include=FALSE}
+periodos_orden <- c(
+  paste0("T1_M", 1:3),
+  paste0("T2_M", 1:3),
+  paste0("T3_M", 1:3),
+  paste0("T4_M", 1:3),
+  paste0("T5_M", 1:3),
+  paste0("T6_M", 1:3),
+  paste0("T7_M", 1:3),
+  paste0("T8_M", 1:3),
+  paste0("T9_M", 1:3),
+  paste0("T10_M", 1:3),
+  paste0("T11_M", 1:3),
+  paste0("T12_M", 1:3),
+  paste0("T13_M", 1:3),
+  paste0("T14_M", 1:3),
+  paste0("T15_M", 1:3)
+)
+
+```
+
+## Matriz de asignación de mini-paneles
+
+Se construye una segunda matriz en formato ancho en la que, cada celda contiene el mini-panel teórico asignado a la UPM en el periodo correspondiente.
+
+En esta matriz:
+
+-   Si la UPM participa en el periodo, se registra el mini-panel.
+
+-   Si la UPM no participa, la celda se le asgina 0.
+
+Esta representación permite una lectura más intuitiva del esquema de rotación, al evidenciar directamente la secuencia de mini-paneles a lo largo de los trimestres y meses.
+
+Cabe resaltar que, aunque la asignación operativa utiliza mini-paneles disponibles en la base (ajuste cíclico), en la salida final se conserva la nomenclatura teórica, garantizando consistencia con el diseño planteado.
+
+```{r, echo=TRUE, include=TRUE}
+# Matriz final con panel asignado por trimestre-mes
+base_paneles <- base_muestra %>%
+  mutate(
+    periodo = paste0(
+      "T", gsub("Trimestre ", "", trimestre),
+      "_M", gsub("Mes ", "", mes)
+    ),
+    panel_mostrar = ifelse(valor == 1, minipanel_asignado, "")
+  ) %>%
+  select(id_upm, periodo, panel_mostrar) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = periodo,
+    values_from = panel_mostrar,
+    values_fill = "0"
+  ) %>%
+  select(id_upm, all_of(periodos_orden))
+
+datatable(
+  base_paneles,
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    scrollY = "400px",
+    autoWidth = TRUE
+  )
+) %>%
+  formatStyle(
+    columns = periodos_orden,
+    valueColumns = periodos_orden,
+    backgroundColor = styleEqual("0", "white", default = "#FDBA74"),
+    color = styleEqual("", "black", default = "black")
+  )                                                                                 
+```
